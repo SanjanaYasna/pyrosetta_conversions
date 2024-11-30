@@ -10,9 +10,6 @@ import torch
 import Bio.PDB.PDBParser as PDBParser
 import Bio.PDB.PDBList as PDBList
 import networkx as nx
-# import torch_geometric
-# import torch_geometric.utils
-import pickle 
 import os
 from torch_geometric.data import DataLoader
 warnings.simplefilter("ignore")
@@ -255,7 +252,7 @@ def _get_aa_frameCloud_triplet_sidechain(atom_coordinates, ca_coord, atom_ids, v
     return  aa_triplets
 
 
-def create_protein_graph(pdb_path, active_and_binding_site_residues, protein):
+def create_protein_graph(active_and_binding_site_residues, protein, start_site):
     """For a given protein pdb_id, extract all functional site annotations and create a graph where the contact map is
     the adjancency matrix, nodes are labelled according to "chain_position_residue" and functionality of nodes is depicted.
 
@@ -274,36 +271,20 @@ def create_protein_graph(pdb_path, active_and_binding_site_residues, protein):
     # print(node_labels, info_dict, coords)
     assert contacts.shape[0] == len(node_labels)
     protein_graph = nx.from_numpy_matrix(contacts)
+    
     # protein_graph.edges
     nx.set_node_attributes(
         protein_graph, name="y", values=0
     )  # 0 for non-functional, 1 for functional
-    nx.set_node_attributes(protein_graph, name="x", values="None")
-    #DSSP iS TODO
-    #nx.set_node_attributes(protein_graph, name="dssp", values="None")
-    nx.set_node_attributes(protein_graph, name="ca_coords", values="None")
-    nx.set_node_attributes(protein_graph, name="angle_geom", values="None")
-    # nx.set_node_attributes(protein_graph, name="coords", values="None")
-
-
     ##### groupby protein structure, set all nodes to none
     ##### select functional sites, put label function, subtype: header
     #take in the active and binding site residues and label their respective nodes as y = 1
     for res_num in active_and_binding_site_residues:
         #index for that residue number
         try:
-            protein_graph.nodes[res_num-1]["y"] = 1
+            protein_graph.nodes[res_num-start_site]["y"] = 1
         except:
             pass
-    #add in ca_coords
-    for i in range(len(coords)):
-        protein_graph.nodes[i]["ca_coords"] = coords[i]
-    #set local lrfs
-    for i in range(len(lrfs)):
-        protein_graph.nodes[i]["angle_geom"] = lrfs[i]
-    #set residue one-hot encodings
-    for i in range(len(residue_one_hot)):
-        protein_graph.nodes[i]["x"] = residue_one_hot[i]
     return protein_graph
     
     '''TO DO: DSSP assignment + possible SASA (
@@ -316,7 +297,7 @@ def create_protein_graph(pdb_path, active_and_binding_site_residues, protein):
 """Adds functionality labels for the ego graph anchor centered at each functional node IF 
 
 
-    >90% of a functional site (what is within 10 distance of that node) is within the ego graph
+    >60% of a functional site (what is within 10 distance of that node) is within the ego graph
     NOTE: "distance" networkx weight metric is used to guage the 10 upper limit. So this isn't necessarily gonig to extract
     all atoms that are 10 angstroms apart, but atoms that fall within 10
     of each other in the binary edges of the graph, which are by default 1 between nodes that are 10 angstroms apart by CA. 
@@ -330,11 +311,11 @@ def create_protein_graph(pdb_path, active_and_binding_site_residues, protein):
         label_graphs (dict): for each (ground truth = 1) functional node, what are the ground truth graph pdbsites
         graph is directly edited in-place to include ego_label attribute
     """
-def ego_label_set(graph: nx.Graph, sites: list, radius = 2, overlap_ratio_cutoff = 0.6):
-    ego_label = {node: 0 for node, att in graph.nodes(data=True)}
-    label_graphs = (
-        {}
-    )  # for each (ground truth = 1) functional node what are the ground truth graph pdbsites
+def ego_label_set(graph: nx.Graph, sites: list, start_site:int, 
+                  radius = 3, 
+                  overlap_ratio_cutoff = 0.7):
+    label_graphs = torch.zeros(len(graph.nodes), dtype=torch.float)
+    print(label_graphs.shape)
     functional_nodes = [
         node for node, att in graph.nodes(data=True) if att["y"] == 1
     ]
@@ -343,7 +324,7 @@ def ego_label_set(graph: nx.Graph, sites: list, radius = 2, overlap_ratio_cutoff
         #count number of functional nodes in ego subgraph
         func_subgraph_nodes = len([
             node for node, att in ego_subgraph.nodes(data=True) if att["y"] == 1
-        ])
+        ]) + 1
         #now find number of functional nodes within 10 angstroms of functional node
         #extract site nodes numbers, and compute distances
         total_func_nodes_ten_apart = 1  
@@ -355,8 +336,9 @@ def ego_label_set(graph: nx.Graph, sites: list, radius = 2, overlap_ratio_cutoff
                 pass
         #if this functional node has at least [overlap_ratio_cutoff] of the functional nodes within 10 angstroms of it, give it an ego label of 1 and add it
         #to label_graphs dictionary
-        if func_subgraph_nodes / total_func_nodes_ten_apart > overlap_ratio_cutoff:
-            ego_label[functional_node] = 1
-            label_graphs[functional_node] = ego_subgraph
-    nx.set_node_attributes(graph, ego_label, "ego_label")
+        
+        if func_subgraph_nodes / total_func_nodes_ten_apart >= overlap_ratio_cutoff:
+            label_graphs[functional_node] = 1
+        
+    # nx.set_node_attributes(graph, ego_label, "ego_label")
     return label_graphs

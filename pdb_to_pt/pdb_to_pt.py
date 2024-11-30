@@ -3,7 +3,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pandas as pd
 import os
-from struc_feat import create_protein_graph, ego_label_set  
+from struc_feat import create_protein_graph, ego_label_set  , load_pdb
 import os
 from torch_geometric.data import Data
 import re
@@ -14,49 +14,63 @@ from Bio.PDB import PDBParser
 
 
 #TODO ADD EC NUMBER AS LABEL TOO
-def generate_geometric_object(id, active_sites, binding_sites, ec_nums):
-    #find the file name from file set that contains id
+def generate_geometric_object(row):
+    id = row['Entry']
     r = re.compile(f'{id}*')
-
     file_name = list(filter(r.match, file_list))
     try:
-        if file_name and not os.path.exists(f'/kuhpc/scratch/slusky/syasna_sta/swissprot_protein_data/pdb_pts/{file_name[0]}.pt'):
+        if file_name and not os.path.exists(f'/Users/robsonlab/Teetly/wildtype_pts/{file_name[0]}.pt'):
             file_name = file_name[0]
             #get the graph object
-            pdb_path = f'/kuhpc/scratch/slusky/syasna_sta/swissprot_protein_data/pdbs/{file_name}'
-            ec_nums = list(ec_nums)
-            functional_nodes = active_sites
-            functional_nodes.extend(binding_sites)
-            #for some unexplained fucking reason, it's like this...do they need their own kind of parser, or what's going on? why is it like this?
+            pdb_path = f'/Users/robsonlab/Teetly/wildtype_pdbs/{file_name}'
+            
+            #get proper active binding site range
+            active_binding_sites = ast.literal_eval(row['Active site'])
+            active_binding_sites.extend(ast.literal_eval(row['Binding site']))
+            active_binding_sites.sort()
+            start_site = int(file_name.split('_')[2])
+            end_site = int(file_name.split('_')[3].split('.')[0])
+            active_binding_sites = [site for site in active_binding_sites if site >= start_site and site <= end_site]
+
+            #parse structure
             parser = PDBParser()
             protein = parser.get_structure(id, pdb_path)
             protein = protein[0]
+            #sanity check
+            residues = list(protein.get_residues())
+            assert len(residues) == end_site - start_site + 1
+            node_labels, coords, lrfs, residue_one_hot = load_pdb(protein)
             
-            #create graph object with functional node labels
-            graph  = create_protein_graph(pdb_path, functional_nodes, protein)
+            #get attributes so far for geometric object
+            residue_one_hot = torch.tensor(residue_one_hot, dtype = torch.float)
+            pos = torch.tensor(coords, dtype=torch.float)
+            angle_geom = torch.tensor(lrfs, dtype=torch.float)
+            
+            #make graph to set edges
+            graph  = create_protein_graph(active_binding_sites, protein, start_site)
+            #get data.y
+            y =  torch.tensor([att["y"] for node, att in graph.nodes(data=True)], dtype=torch.float)
+            
             #get the data.y labels  and the one-hot encoding of each node
-            label_graphs = ego_label_set(graph, functional_nodes)
-            #one_hot embeddings are the problematic ones...
-            try:
-                node_one_hot = torch.tensor([att["x"] for node, att in graph.nodes(data=True) if node is not None])
-            except:
-                node_one_hot = [att["x"] for node, att in graph.nodes(data=True)]
-                #filter out none values
-                node_one_hot = [node for node in node_one_hot if node is not None]
-                node_one_hot = torch.tensor(node_one_hot)
-            pos = torch.tensor([att["ca_coords"] for node, att in graph.nodes(data=True)])
+            label_graphs = ego_label_set(graph, active_binding_sites, start_site)
             edge_index = torch.LongTensor(list(graph.edges)).t().contiguous()
-            angle_geom = torch.tensor([att["angle_geom"] for node, att in graph.nodes(data=True)])
+            
+            #ec nums
+            ecs = ast.literal_eval(row['EC_Shortened'])
+            ec_vals = torch.zeros(8, dtype=torch.float)
+            if len(ecs) > 0:
+                for ec in ecs:
+                    ec_vals[ec] = 1
             #properties
             data = Data(
                 protein_id = id,
-                ec_number = ec_nums,
+                ec_number = ec_vals,
                 edge_index = edge_index,  
                 label_graphs = label_graphs, 
-                x = node_one_hot, 
+                x = residue_one_hot, 
                 pos = pos,
                 angle_geom = angle_geom,
-                y = torch.tensor([att["y"] for node, att in graph.nodes(data=True)]),
+                y = y,
             )
             torch.save(data, out_dir + "/" + file_name + ".pt")
     except:
@@ -64,25 +78,10 @@ def generate_geometric_object(id, active_sites, binding_sites, ec_nums):
 
 if __name__ == '__main__':
     #convert tsv to csv
-    alphafold = pd.read_csv("/kuhpc/work/slusky/syasna_sta/func_pred/AFEnzymeRelax/data_stats/possible_tsvs/final_protein_dataset.csv")
-    #get pool object with 30 processes
-    ids = list(alphafold['Entry'])
-    ec_nums = list(alphafold['EC_Shortened'])
-    ec_nums = [ast.literal_eval(num) for num in ec_nums]
-    active_sites = list(alphafold['Active site'])
-    active_sites = [ast.literal_eval(site) for site in active_sites]
-    binding_sites = list(alphafold['Binding site'])
-    binding_sites = [ast.literal_eval(site) for site in binding_sites]
-    file_set = set(os.listdir("/kuhpc/scratch/slusky/syasna_sta/swissprot_protein_data/pdbs"))
-    
-    out_dir = '/kuhpc/scratch/slusky/syasna_sta/swissprot_protein_data/pdb_pts'
-    file_list = list(file_set)
+    csv = pd.read_csv("/Users/robsonlab/Teetly/get_data_pyrosetta/ec_1_4_start_truncated.csv")
+    out_dir = '/Users/robsonlab/Teetly/wildtype_pts'
+    file_list = list(os.listdir("/Users/robsonlab/Teetly/wildtype_pdbs"))
     
     #need to streamline these thre alues
-    
-    Parallel(n_jobs=-1, backend="threading")(delayed(generate_geometric_object)(
-        ids[i], active_sites[i], binding_sites[i], ec_nums[i]) 
-                                        for i in range(len(ids)))
-                                        #     now do circular range from half of len ids to around, and this is worst case only arond 1/5th done
-                                        #   for i in range(len(ids)))
-                                        # for i in reversed(range(len(ids))))
+    Parallel(n_jobs=-1, backend="threading")(delayed(generate_geometric_object)(row) for idx, row in
+                                             csv.iterrows())
